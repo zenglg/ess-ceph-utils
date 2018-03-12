@@ -1,0 +1,2 @@
+SUBSYSTEM=="block", ACTION=="add", ENV{ID_FS_TYPE}=="bcache", RUN+="esstorage-udev-disk-hotplug add $tempnode"
+SUBSYSTEM=="block", ACTION=="remove", ENV{ID_FS_TYPE}=="bcache", RUN+="esstorage-udev-disk-hotplug remove $tempnode"

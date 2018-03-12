@@ -1,0 +1,186 @@
+#!/bin/sh
+
+AWK=$(/usr/bin/which awk)
+AWK=${AWK:-"/usr/bin/awk"}
+
+DOCKER=$(/usr/bin/which docker)
+DOCKER=${DOCKER:-"/usr/bin/docker"}
+
+ECHO=$(/usr/bin/which echo)
+ECHO=${ECHO:-"/usr/bin/echo"}
+
+GREP=$(/usr/bin/which grep)
+GREP=${GREP:-"/usr/bin/grep"}
+
+KUBECTL=$(/usr/bin/which kubectl)
+KUBECTL=${KUBECTL:-"/usr/bin/kubectl"}
+
+LSMOD=$(/usr/bin/which lsmod)
+LSMOD=${LSMOD:-"/usr/sbin/lsmod"}
+
+MODINFO=$(/usr/bin/which modinfo)
+MODINFO=${MODINFO:-"/usr/sbin/modinfo"}
+
+MODPROBE=$(/usr/bin/which modprobe)
+MODPROBE=${MODPROBE:-"/usr/sbin/modprobe"}
+
+OUTLOG_DIR="/var/log/esstorage/"
+OUTLOG=${OUTLOG_DIR}"esstorage-disk.log"
+
+log()
+{
+	local str=$@
+
+	${ECHO} $(date) : ${str} >> ${OUTLOG}
+}
+
+look_up_changed_disk()
+{
+	local device=$1
+
+	if ${ECHO} ${device} | grep -q '[0-9]\{1,\}p[0-9]\{1,\}' ; then
+		${ECHO} ${device} | sed 's/p[0-9]\{1,\}//g'
+	else
+		${ECHO} ${device} | sed 's/[0-9]\{1,\}//g'
+	fi
+}
+
+look_up_disk_in_k8s()
+{
+	local ds=$1
+	local key_word="BLUESTORE_DATA_DISK"
+
+	${docker_exec} ${KUBECTL} get ds ${ds} -n ceph -o json | \
+		grep -A 1 DATA | tr '\n' ' ' | awk '{print $4}' | sed 's/"//g'
+}
+
+look_up_osd_ds()
+{
+	local node=$1
+	local changed_disk=$(look_up_changed_disk $2)
+
+	local osd_ds=$(${docker_exec} ${KUBECTL} get ds -n ceph -o wide |
+		       ${GREP} ceph-osd | ${GREP} ${node} |
+		       ${AWK} '{print $1}')
+
+	log "osd_ds is ${osd_ds}"
+
+	local ret_ds=""
+	for ds in ${osd_ds}
+	do
+		local disk_in_k8s=$(look_up_disk_in_k8s ${ds})
+		if [ "${changed_disk}" == $(readlink -f "${disk_in_k8s}") ]; then
+			ret_ds=${ds}
+			break
+		fi
+	done
+
+	if [ -z ${ret_ds} ]; then
+		log "ret_ds is [ null ]."
+		return 1
+	fi
+
+	log "ret_ds is ${ret_ds}"
+	${ECHO} "${ret_ds}"
+
+	return 0
+}
+
+look_up_osd_device_label()
+{
+	local ds=$1
+
+	local label=$(${docker_exec} ${KUBECTL} get ds ${ds} -o template \
+			--template={{.spec.template.spec.nodeSelector}} | \
+		      grep -o "ceph-osd-device[0-9a-z\-]*:" | sed 's/://g')
+	if [ -z ${label} ]; then
+		log "label is [ null ]."
+		return 1
+	fi
+
+	log "label is ${label}"
+	${ECHO} ${label}
+
+	return 0
+}
+
+if [ ! -e "${OUTLOG_DIR}" ]; then
+	mkdir ${OUTLOG_DIR}
+fi
+
+if [ ! -d "${OUTLOG_DIR}" ]; then
+	log "WARNING - ${OUTLOG_DIR} is not a directory"
+fi
+
+log "\$1 is [ $1 ], \$2 is [ $2 ]"
+
+if [ $1 == "add" ]; then
+	tmp=$(${MODINFO} escache &> /dev/null; ${ECHO} $?)
+	if [ ${tmp} -eq 0 ]; then
+	        cache_type="escache"
+	else
+	        tmp=$(${MODINFO} bcache &> /dev/null; ${ECHO} $?)
+	        if [ ${tmp} -eq 0 ]; then
+	                cache_type="bcache"
+	        else
+	                log "ERROR - No escache and bcache."
+	                exit 1
+	        fi
+	fi
+
+	${LSMOD} | ${GREP} -q "^${cache_type}"
+	if [ $? -ne 0 ]; then
+		${MODPROBE} ${cache_type}
+	fi
+
+	${ECHO} $2 > /sys/fs/${cache_type}/register
+fi
+
+log "lsblk"
+lsblk >> ${OUTLOG}
+
+docker_exec="${DOCKER} exec $(docker ps -a |
+	     ${GREP} 'Up .*activate-pod_ceph-osd-' |
+	     ${AWK} '{print $1}' | sed -n '1p')"
+if [ -z ${docker_exec} ]; then
+	log "docker_exec is [ null ]."
+	exit 1
+fi
+
+node=$(hostname -s)
+log "node is [ ${node} ], device is [ ${2} ]"
+osd_ds=$(look_up_osd_ds ${node} $2)
+osd_device_label=$(look_up_osd_device_label ${osd_ds})
+
+if [ -z ${osd_device_label} ]; then
+	log "osd_device_label is [ null ]."
+	exit 1
+fi
+
+log "osd_device_label is ${osd_device_label}"
+
+case $1 in
+"add")
+	status=$(${docker_exec} ${KUBECTL} get ds/${osd_ds} -o template \
+			--template={{.status.desiredNumberScheduled}})
+	log "status: ${status}"
+	if [ ${status} == "0" ]; then
+		log "timeout 10 ${docker_exec} ${KUBECTL} label nodes ${node} ${osd_device_label}=enabled --overwrite"
+		timeout 10 ${docker_exec} ${KUBECTL} label nodes ${node} \
+			${osd_device_label}=enabled --overwrite
+	fi
+	;;
+"remove")
+	status=$(${docker_exec} ${KUBECTL} get ds/${osd_ds} -o template \
+			--template={{.status.desiredNumberScheduled}})
+	log "status: ${status}"
+	if [ ${status} == "1" ]; then
+		log "timeout 10 ${docker_exec} ${KUBECTL} label nodes ${node} ${osd_device_label}=disabled --overwrite"
+		timeout 10 ${docker_exec} ${KUBECTL} label nodes ${node} \
+			${osd_device_label}=disabled --overwrite
+	fi
+	;;
+*)
+	log "$1 should be add|remove"
+	;;
+esac

@@ -181,6 +181,6 @@ case $1 in
 	fi
 	;;
 *)
-	log "$1 should be add|remove"
+	log "\$1 is $1, should be add|remove"
 	;;
 esac

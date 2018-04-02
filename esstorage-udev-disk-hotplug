@@ -72,6 +72,9 @@ look_up_osd_ds()
 		if [ "${changed_disk}" == $(readlink -f "${disk_in_k8s}") ]; then
 			ret_ds=${ds}
 			break
+		elif [ ! -e ${disk_in_k8s} ]; then
+			ret_ds=${ds}
+			break
 		fi
 	done
 

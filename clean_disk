@@ -1,0 +1,44 @@
+#!/bin/sh
+
+bs=8k
+count=1
+
+# get all disks.
+disks=$(ls /sys/block/ | grep -E "vd|sd|nvme")
+disks=$(echo ${disks} | sed "s/\n/ /g")
+
+echo "disks: [ $disks ]"
+
+clean_disk_partition_table()
+{
+	local disk=$1
+
+	# clean disk partition table.
+	parts=$(ls /sys/block/${disk}/ | grep ${disk})
+	parts=$(echo ${parts} | sed "s/\n/ /g")
+	echo "parts: [ ${parts} ]"
+	for part in ${parts}
+	do
+		echo "part: [ ${part} ]"
+		dd if=/dev/zero of=/dev/${part} bs=${bs} count=${count} oflag=sync
+		sync
+	done
+	dd if=/dev/zero of=/dev/${disk} bs=${bs} count=${count} oflag=sync
+	partx -d /dev/${disk}
+	sync
+	# wait for the kernel to update.
+	sleep 5
+	echo
+}
+
+for disk in ${disks}
+do
+	echo ${disk}
+	# skip the old os disks.
+	lvmdiskscan | awk /"LVM physical volume$"/'{print $1}' | grep -q ${disk}
+	if [ $? -eq 0 ]; then
+		continue
+	fi
+
+	clean_disk_partition_table ${disk}
+done
